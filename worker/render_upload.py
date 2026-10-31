@@ -23,7 +23,10 @@ GEMINI_FALLBACK_MODEL = os.environ.get("GEMINI_FALLBACK_MODEL", "")
 GEMINI_IMAGE_MODELS = [m.strip() for m in (os.environ.get("GEMINI_IMAGE_MODEL")
                        or "gemini-3-pro-image-preview,gemini-2.5-flash-image").split(",") if m.strip()]
 TTS_ENGINE = os.environ.get("TTS_ENGINE") or "gemini"            # "gemini" (natural narrator) or "edge"
+# Edge voice only when explicitly allowed; otherwise a Gemini voice problem stops the run instead of using a robotic voice
+EDGE_FALLBACK = (os.environ.get("TTS_EDGE_FALLBACK") or "").lower() == "true"
 GEMINI_TTS_MODEL = os.environ.get("GEMINI_TTS_MODEL") or "gemini-2.5-flash-preview-tts"
+ACTIVE_TTS_MODEL = None   # set by tts_preflight() to a model that really works with this key
 GEMINI_TTS_VOICE = os.environ.get("GEMINI_TTS_VOICE") or "Charon"   # calm, informative male; "Kore" = firm female
 EDGE_RATE = os.environ.get("EDGE_RATE") or "-4%"                    # slightly slower sounds less robotic
 SCENES_PER_TTS = 6
@@ -175,24 +178,71 @@ def edge_voiceover(scenes, tmp):
     return join_wavs(wavs, tmp), durs
 
 
+def gemini_tts(model, text):
+    """One Gemini TTS request. Returns (raw 16-bit PCM bytes, sample rate)."""
+    body = {"contents": [{"role": "user", "parts": [{"text": NARRATOR_STYLE + "\n\n" + text}]}],
+            "generationConfig": {"responseModalities": ["AUDIO"], "speechConfig": {
+                "voiceConfig": {"prebuiltVoiceConfig": {"voiceName": GEMINI_TTS_VOICE}}}}}
+    for p in gemini_call(model, body, timeout=300):
+        data = p.get("inlineData") or p.get("inline_data")
+        if data and data.get("data"):
+            rate = re.search(r"rate=(\d+)", data.get("mimeType") or data.get("mime_type") or "")
+            return base64.b64decode(data["data"]), rate.group(1) if rate else "24000"
+    raise RuntimeError(f"{model} returned no audio")
+
+
+def tts_candidates():
+    """The configured TTS model first, then every TTS model this API key can actually see (names change over time)."""
+    found = []
+    try:
+        r = requests.get("https://generativelanguage.googleapis.com/v1beta/models", params={"pageSize": 200},
+                         headers={"x-goog-api-key": GEMINI_KEY}, timeout=60)
+        r.raise_for_status()
+        found = [m["name"].split("/", 1)[-1] for m in r.json().get("models", [])
+                 if "tts" in m["name"] and "generateContent" in m.get("supportedGenerationMethods", [])]
+        found.sort(key=lambda n: ("pro" in n, "preview" in n))   # flash (higher free limits) before pro
+        log(f"TTS models available to this key: {found or 'none'}")
+    except Exception as e:
+        log(f"Could not list Gemini models: {str(e)[:200]}")
+    return list(dict.fromkeys([GEMINI_TTS_MODEL] + found))
+
+
+def tts_preflight():
+    """Checks, BEFORE taking a job from the Sheet, that the natural Gemini voice really works. Returns True if usable."""
+    global ACTIVE_TTS_MODEL
+    if TTS_ENGINE == "edge":
+        log("Voice: Edge (TTS_ENGINE=edge)")
+        return True
+    if not GEMINI_KEY:
+        log("Voice problem: GEMINI_API_KEY secret is missing or empty in GitHub > Settings > Secrets > Actions")
+        return False
+    for model in tts_candidates():
+        try:
+            pcm, _ = gemini_tts(model, "नमस्ते, यह आवाज़ की जाँच है।")
+            if len(pcm) < 10000:
+                raise RuntimeError("audio too short")
+            ACTIVE_TTS_MODEL = model
+            log(f"Voice: Gemini {model} ({GEMINI_TTS_VOICE}) works")
+            return True
+        except Exception as e:
+            log(f"Voice test with {model} failed: {str(e)[:250]}")
+    return False
+
+
 def gemini_voiceover(scenes, tmp):
     """Natural narrator voice from Gemini TTS. Scenes are voiced in groups (fewer requests, smoother delivery);
     each scene's share of a group's audio is estimated from its length in characters."""
     wavs, durs = [], []
     groups = [scenes[i:i + SCENES_PER_TTS] for i in range(0, len(scenes), SCENES_PER_TTS)]
     for g, group in enumerate(groups):
-        log(f"Voiceover (Gemini, {GEMINI_TTS_VOICE}) part {g + 1}/{len(groups)}")
+        log(f"Voiceover (Gemini {ACTIVE_TTS_MODEL}, {GEMINI_TTS_VOICE}) part {g + 1}/{len(groups)}")
         text = " ".join(group)
-        body = {"contents": [{"role": "user", "parts": [{"text": NARRATOR_STYLE + "\n\n" + text}]}],
-                "generationConfig": {"responseModalities": ["AUDIO"], "speechConfig": {
-                    "voiceConfig": {"prebuiltVoiceConfig": {"voiceName": GEMINI_TTS_VOICE}}}}}
         for attempt in range(4):
             try:
-                part = next(p for p in gemini_call(GEMINI_TTS_MODEL, body, timeout=300) if "inlineData" in p)
-                rate = re.search(r"rate=(\d+)", part["inlineData"].get("mimeType", "")) or None
+                pcm, rate = gemini_tts(ACTIVE_TTS_MODEL, text)
                 raw, wav = os.path.join(tmp, f"g{g}.pcm"), os.path.join(tmp, f"g{g}.wav")
-                open(raw, "wb").write(base64.b64decode(part["inlineData"]["data"]))
-                run(["ffmpeg", "-y", "-f", "s16le", "-ar", rate.group(1) if rate else "24000", "-ac", "1", "-i", raw,
+                open(raw, "wb").write(pcm)
+                run(["ffmpeg", "-y", "-f", "s16le", "-ar", rate, "-ac", "1", "-i", raw,
                      "-af", "apad=pad_dur=0.4", "-ar", "24000", "-ac", "1", wav])
                 d = duration(wav)
                 if d < len(text) / 30:   # Hindi speech is ~12-18 chars/s; much shorter means the audio was cut off
@@ -211,14 +261,16 @@ def gemini_voiceover(scenes, tmp):
 
 
 def make_voiceover(scenes, tmp):
-    if GEMINI_KEY and TTS_ENGINE != "edge":
+    if ACTIVE_TTS_MODEL:
         try:
             out, durs = gemini_voiceover(scenes, tmp)
             log(f"Voiceover ready (Gemini, {sum(durs) / 60:.1f} min, {len(scenes)} scenes)")
             return out, durs
         except Exception as e:
+            if not EDGE_FALLBACK:   # the job goes back to the queue and is retried with the Gemini voice next run
+                raise RuntimeError(f"Gemini voice failed mid-video: {str(e)[:200]}")
             # the whole video falls back, so one video never mixes two different voices
-            log(f"Gemini TTS failed ({str(e)[:200]}), using the Edge voice for this video")
+            log(f"Gemini TTS failed ({str(e)[:200]}), using the Edge voice for this video (TTS_EDGE_FALLBACK=true)")
     out, durs = edge_voiceover(scenes, tmp)
     log(f"Voiceover ready (Edge, {sum(durs) / 60:.1f} min, {len(scenes)} scenes)")
     return out, durs
@@ -408,7 +460,8 @@ def track_seconds(f):
 def archive_music(tags, tmp):
     """Most-downloaded mood-matched track from the Internet Archive netlabels collection whose licence allows use in a
     monetised video (CC BY, CC BY-SA or public domain; NC/ND are skipped). Returns (path, credit) or (None, "")."""
-    moods = list(dict.fromkeys(MUSIC_MOODS.get(t, t) for t in tags)) + ["ambient soundtrack"]
+    # the documentary's own mood first, then broad moods that netlabels always has plenty of
+    moods = list(dict.fromkeys([MUSIC_MOODS.get(t, t) for t in tags] + ["ambient soundtrack", "ambient", "electronic ambient", "piano"]))
     for mood in moods:
         try:
             r = requests.get("https://archive.org/advancedsearch.php", timeout=60, params={
@@ -418,8 +471,12 @@ def archive_music(tags, tmp):
                 "sort[]": "downloads desc", "rows": 100, "output": "json"})
             r.raise_for_status()
             albums = [d for d in r.json().get("response", {}).get("docs", []) if SAFE_LICENCE.search(str(d.get("licenseurl", "")))]
-            log(f"  music '{mood}': {len(albums)} popular albums with a commercial-use licence")
-            for album in random.sample(albums[:6], min(6, len(albums))):   # one of the most downloaded, varied per video
+        except Exception as e:
+            log(f"  music search '{mood}' failed: {e}")
+            continue
+        log(f"  music '{mood}': {len(albums)} popular albums with a commercial-use licence")
+        for album in random.sample(albums[:6], min(6, len(albums))):   # one of the most downloaded, varied per video
+            try:
                 meta = requests.get(f"https://archive.org/metadata/{album['identifier']}", timeout=60).json()
                 tracks = [f for f in meta.get("files", []) if f["name"].lower().endswith(".mp3")
                           and 120 <= track_seconds(f) <= 900]
@@ -440,8 +497,8 @@ def archive_music(tags, tmp):
                           f"https://archive.org/details/{album['identifier']}")
                 log(f"Music bed: {name} by {creator} [{mood}, {album.get('downloads')} downloads, {track_seconds(f):.0f}s]")
                 return path, credit
-        except Exception as e:
-            log(f"  music search '{mood}' failed: {e}")
+            except Exception as e:
+                log(f"  music album {album.get('identifier')} skipped: {e}")
     return None, ""
 
 
@@ -603,6 +660,10 @@ def upload(job, video, thumb, music_credit=""):
 def main():
     if not PIXABAY_KEY:
         sys.exit("PIXABAY_API_KEY secret is missing: add it in GitHub > Settings > Secrets > Actions.")
+    if not tts_preflight() and not EDGE_FALLBACK:
+        # stop before touching the Sheet, so the queued video keeps its place and its retry count
+        sys.exit("Natural Gemini voice is not working (see the lines above), so no video was made. "
+                 "Fix the key/model, or set the TTS_EDGE_FALLBACK=true secret to allow the Edge voice.")
     log("Asking the Brain for a job...")
     job = api({"action": "next"}, tries=3).get("job")
     if not job:
