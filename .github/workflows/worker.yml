@@ -11,7 +11,7 @@ concurrency:
 jobs:
   render-and-upload:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 100   # 1080p edit with ~100 shots and transitions takes roughly 30-60 min
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
