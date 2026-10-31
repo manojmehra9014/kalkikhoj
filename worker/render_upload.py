@@ -1,7 +1,7 @@
-"""KalKiKhoj worker: fetch a queued job from Apps Script, build a documentary-style video
-(free Hindi TTS + Pixabay stock videos/photos matched to each part of the narration + ffmpeg),
-upload to YouTube, report back."""
-import asyncio, base64, io, json, math, os, re, subprocess, sys, tempfile, time, traceback
+"""KalKiKhoj worker: fetch a queued job from Apps Script, build a professionally edited 1080p documentary
+(natural Hindi narration + Pixabay stock footage matched to each part of the narration, smooth transitions,
+colour grade, music bed, loudness-normalised audio), upload to YouTube, report back."""
+import asyncio, base64, glob, io, json, math, os, random, re, shutil, subprocess, sys, tempfile, time, traceback
 
 import edge_tts
 import requests
@@ -31,10 +31,19 @@ NARRATOR_STYLE = ("Read the following Hindi text aloud as an experienced Indian 
                   "conversational, like a real person telling a fascinating story. Use natural pauses at commas and full "
                   "stops, gentle emphasis on important words, and a steady, unhurried pace. Read only the text below, "
                   "word for word; do not read these instructions.")
-W, H, FPS = 1280, 720, 25
-SCENE_WORDS = 28      # narration words per scene (~10 s of Hindi speech)
-MAX_SHOT = 7.0        # seconds; longer scenes get several different visuals
+MUSIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "music")   # drop royalty-free .mp3 files here
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent"
+
+W, H, FPS = 1920, 1080, 25
+SCENE_WORDS = 28      # narration words per scene (~10 s of Hindi speech)
+MAX_SHOT = 6.0        # seconds; longer scenes get several different visuals
+TF = 12               # transition length in frames (~0.5 s)
+CHUNK = 12            # shots joined per ffmpeg pass (keeps memory low)
+# a calm cross-dissolve most of the time, an occasional slide or dip to black at a new scene
+SCENE_TRANSITIONS = ["fade", "smoothleft", "fade", "fadeblack", "fade", "smoothright", "fade", "slideleft"]
+LOOK = "eq=contrast=1.06:saturation=1.12:gamma=0.98,vignette=angle=PI/7"   # gentle cinematic grade
+WORK_ENC = ["-an", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "15", "-r", str(FPS),
+            "-pix_fmt", "yuv420p", "-video_track_timescale", "12800"]   # near-lossless intermediates
 
 
 def log(msg):
@@ -61,7 +70,7 @@ def api(payload, tries=1):
 def run(cmd):
     p = subprocess.run(cmd, capture_output=True, text=True)
     if p.returncode:
-        raise RuntimeError("ffmpeg failed: " + p.stderr[-600:])
+        raise RuntimeError("ffmpeg failed: " + p.stderr[-800:])
 
 
 def duration(path):
@@ -70,7 +79,7 @@ def duration(path):
     return float(out.stdout.strip())
 
 
-# ---------- Gemini (scene plan + thumbnail image) ----------
+# ---------- Gemini (scene plan, voice, thumbnail) ----------
 def gemini_call(model, body, timeout=180):
     r = requests.post(GEMINI_URL.format(model), headers={"x-goog-api-key": GEMINI_KEY}, json=body, timeout=timeout)
     if not r.ok:
@@ -106,7 +115,7 @@ def gemini_image(model, prompt, path):
     for p in parts:
         data = (p.get("inlineData") or p.get("inline_data") or {}).get("data")
         if data:
-            save_cover(base64.b64decode(data), path)
+            save_cover(base64.b64decode(data), path, (1280, 720))
             return
     raise RuntimeError("no image in Gemini response")
 
@@ -214,32 +223,34 @@ def search_words(text, n=4):
 
 
 def plan_visuals(job, scenes):
-    """English stock-footage search words for every scene + a thumbnail prompt."""
+    """Two English stock-footage searches (main + backup) for every scene, plus the thumbnail idea."""
     prompts = job.get("image_prompts") or [job.get("thumb_idea") or "india documentary"]
-    fallback = [search_words(prompts[i * len(prompts) // len(scenes)]) for i in range(len(scenes))]
-    plan = {"queries": fallback, "thumbnail_prompt": job.get("thumb_idea") or job["title"], "thumbnail_query": fallback[0],
-            "thumbnail_text": ""}
+    fallback = [[search_words(prompts[i * len(prompts) // len(scenes)])] for i in range(len(scenes))]
+    plan = {"queries": fallback, "thumbnail_prompt": job.get("thumb_idea") or job["title"],
+            "thumbnail_query": fallback[0][0], "thumbnail_text": ""}
     if not GEMINI_KEY:
         log("No GEMINI_API_KEY, using the image prompts from the Sheet as search words")
         return plan
     numbered = "\n".join(f"{i + 1}. {s}" for i, s in enumerate(scenes))
     try:
         out = gemini_json(
-            "You are the editor of a Hindi YouTube documentary. For EACH numbered narration segment below, give an English "
-            "search query (2-4 concrete visual words) to find matching stock B-roll footage on Pixabay, e.g. 'indian city traffic', "
-            "'robot arm factory', 'student using laptop', 'ancient temple ruins'. Show what is being talked about; no names of real "
-            "people or brands, no abstract words.\n"
+            "You are the editor of a professional Hindi YouTube documentary. For EACH numbered narration segment below, "
+            "choose the B-roll a good editor would cut to while that line is spoken. Give two English stock-footage search "
+            "queries for Pixabay, 'main | backup', each 2-4 concrete visual words (what the camera would actually show), e.g. "
+            "'indian city traffic | busy street night', 'robot arm factory | assembly line machines'. The backup should be "
+            "more generic so it always finds footage. No names of real people or brands, no abstract words. Keep visual "
+            "continuity between neighbouring segments.\n"
             f"Also give thumbnail_prompt: a vivid English prompt for an eye-catching 16:9 YouTube thumbnail image about '{job['title']}' "
             "(describe the scene only, no text, no logos, no real people), thumbnail_text: a punchy 2-4 word Hindi headline "
             "in Devanagari for the thumbnail (curiosity-driven, not misleading), and thumbnail_query: 2-4 words to find a thumbnail photo.\n"
-            f'Return ONLY JSON: {{"queries":["..." x {len(scenes)}],"thumbnail_prompt":"","thumbnail_text":"","thumbnail_query":""}}\n\n'
+            f'Return ONLY JSON: {{"queries":["main | backup" x {len(scenes)}],"thumbnail_prompt":"","thumbnail_text":"","thumbnail_query":""}}\n\n'
             "SEGMENTS:\n" + numbered)
-        q = [str(x).strip() for x in (out.get("queries") or [])]
-        plan["queries"] = [q[i] if i < len(q) and q[i] else fallback[i] for i in range(len(scenes))]
+        q = [[p.strip() for p in str(x).split("|") if p.strip()] for x in (out.get("queries") or [])]
+        plan["queries"] = [(q[i] if i < len(q) and q[i] else []) + fallback[i] for i in range(len(scenes))]
         plan["thumbnail_prompt"] = out.get("thumbnail_prompt") or plan["thumbnail_prompt"]
         plan["thumbnail_query"] = out.get("thumbnail_query") or plan["thumbnail_query"]
         plan["thumbnail_text"] = str(out.get("thumbnail_text") or "").strip()[:40]
-        log(f"Scene plan from Gemini: {len(q)} queries, e.g. {plan['queries'][:3]}")
+        log(f"Scene plan from Gemini: {len(q)} scenes, e.g. {plan['queries'][:2]}")
     except Exception as e:
         log(f"Gemini scene plan failed ({e}), using the image prompts from the Sheet instead")
     return plan
@@ -253,9 +264,9 @@ def pixabay(kind, q):
     key = (kind, q)
     if key not in PIXABAY_CACHE:
         url = "https://pixabay.com/api/videos/" if kind == "video" else "https://pixabay.com/api/"
-        params = {"key": PIXABAY_KEY, "q": q[:100], "safesearch": "true", "per_page": 20}
+        params = {"key": PIXABAY_KEY, "q": q[:100], "safesearch": "true", "per_page": 30}
         if kind == "photo":
-            params.update(image_type="photo", orientation="horizontal")
+            params.update(image_type="photo", orientation="horizontal", min_width=1280)
         hits = []
         for attempt in range(3):
             r = requests.get(url, params=params, timeout=60)
@@ -269,38 +280,38 @@ def pixabay(kind, q):
     return PIXABAY_CACHE[key]
 
 
-def save_cover(data, path):
+def save_cover(data, path, size=(W, H)):
+    w, h = size
     im = Image.open(io.BytesIO(data)).convert("RGB")
     # cover-crop to 16:9
-    scale = max(W / im.width, H / im.height)
-    im = im.resize((int(im.width * scale), int(im.height * scale)))
-    l, t = (im.width - W) // 2, (im.height - H) // 2
-    im.crop((l, t, l + W, t + H)).save(path, quality=90)
+    scale = max(w / im.width, h / im.height)
+    im = im.resize((int(im.width * scale + 0.5), int(im.height * scale + 0.5)), Image.LANCZOS)
+    l, t = (im.width - w) // 2, (im.height - h) // 2
+    im.crop((l, t, l + w, t + h)).save(path, quality=92)
 
 
 def landscape_video(hit):
-    for size in ("medium", "large", "small"):
+    for size in ("large", "medium"):   # prefer real 1080p footage
         v = (hit.get("videos") or {}).get(size) or {}
-        if v.get("url") and v.get("width", 0) >= v.get("height", 1) and v.get("width", 0) >= 960:
+        if v.get("url") and v.get("width", 0) >= v.get("height", 1) and v.get("width", 0) >= 1280:
             return v["url"]
     return None
 
 
-def fetch_visual(query, want_video, n, tmp):
-    """Returns (kind, path) where kind is 'video', 'photo' or 'card'."""
-    words = query.split()
-    for q in dict.fromkeys([query, " ".join(words[:2]), words[0] if words else ""]):
-        if not q:
-            continue
+def fetch_visual(queries, want_video, need_sec, n, tmp):
+    """Best unused footage for this shot. Returns (kind, path) with kind 'video', 'photo' or 'card'."""
+    tries = list(dict.fromkeys(queries + [" ".join(q.split()[:2]) for q in queries]))
+    for q in tries:
         for kind in (("video", "photo") if want_video else ("photo", "video")):
             try:
-                for hit in pixabay(kind, q):
-                    if (kind, hit["id"]) in USED:
-                        continue
+                hits = [h for h in pixabay(kind, q) if (kind, h["id"]) not in USED]
+                if kind == "video":   # clips long enough not to loop come first
+                    hits.sort(key=lambda h: h.get("duration", 0) < need_sec)
+                for hit in hits:
                     src = landscape_video(hit) if kind == "video" else hit.get("largeImageURL")
                     if not src:
                         continue
-                    data = requests.get(src, timeout=120)
+                    data = requests.get(src, timeout=180)
                     data.raise_for_status()
                     USED.add((kind, hit["id"]))
                     if kind == "video":
@@ -309,62 +320,134 @@ def fetch_visual(query, want_video, n, tmp):
                     else:
                         path = os.path.join(tmp, f"src{n}.jpg")
                         save_cover(data.content, path)
-                    return kind, path
+                    return kind, path, q
             except Exception as e:
                 log(f"  shot {n + 1}: pixabay {kind} '{q}' failed: {e}")
     path = os.path.join(tmp, f"src{n}.jpg")
     Image.new("RGB", (W, H), (20 + n * 15 % 80, 30, 60)).save(path)   # plain fallback card
-    return "card", path
+    return "card", path, ""
 
 
-# ---------- rendering ----------
-ENC = ["-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-r", str(FPS),
-       "-pix_fmt", "yuv420p", "-video_track_timescale", "12800"]
-
-
+# ---------- editing ----------
 def render_shot(kind, src, frames, n, tmp):
     out = os.path.join(tmp, f"shot{n:03d}.mp4")
     if kind == "video":
-        vf = f"scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},fps={FPS},setsar=1"
-        run(["ffmpeg", "-y", "-stream_loop", "-1", "-i", src, "-vf", vf, "-frames:v", str(frames)] + ENC + [out])
+        vf = f"scale={W}:{H}:force_original_aspect_ratio=increase:flags=lanczos,crop={W}:{H},fps={FPS},setsar=1,{LOOK}"
+        run(["ffmpeg", "-y", "-stream_loop", "-1", "-i", src, "-vf", vf, "-frames:v", str(frames)] + WORK_ENC + [out])
     else:
-        # slow zoom in / zoom out / pan, so photos feel alive
-        z, x, y = [("1+0.15*on/{N}", "iw/2-(iw/zoom/2)", "ih/2-(ih/zoom/2)"),
-                   ("1.15-0.15*on/{N}", "iw/2-(iw/zoom/2)", "ih/2-(ih/zoom/2)"),
-                   ("1.15", "(iw-iw/zoom)*on/{N}", "ih/2-(ih/zoom/2)")][n % 3]
+        # slow Ken Burns move (zoom in / zoom out / pan) so photos feel alive
+        z, x, y = [("1+0.12*on/{N}", "iw/2-(iw/zoom/2)", "ih/2-(ih/zoom/2)"),
+                   ("1.12-0.12*on/{N}", "iw/2-(iw/zoom/2)", "ih/2-(ih/zoom/2)"),
+                   ("1.12", "(iw-iw/zoom)*on/{N}", "ih/2-(ih/zoom/2)")][n % 3]
         z, x = z.format(N=frames), x.format(N=frames)
-        vf = (f"scale={W * 2}:{H * 2},zoompan=z='{z}':x='{x}':y='{y}':d={frames}:s={W}x{H}:fps={FPS},setsar=1")
-        run(["ffmpeg", "-y", "-i", src, "-vf", vf, "-frames:v", str(frames)] + ENC + [out])
+        vf = (f"scale={W * 2}:{H * 2}:flags=lanczos,zoompan=z='{z}':x='{x}':y='{y}':d={frames}:s={W}x{H}:fps={FPS},"
+              f"setsar=1,{LOOK}")
+        run(["ffmpeg", "-y", "-i", src, "-vf", vf, "-frames:v", str(frames)] + WORK_ENC + [out])
+    os.remove(src)
     return out
 
 
-def build_video(scenes, durs, plan, audio, tmp):
-    shots, t, n, real = [], 0.0, 0, 0
-    total_shots = sum(max(1, math.ceil(d / MAX_SHOT)) for d in durs)
+def xfade_join(clips, slots, transitions, out):
+    """Cross-transition clips. Every clip except the very last one of the film is TF frames longer than its slot,
+    so each transition starts exactly at its slot boundary and the picture never drifts from the voice."""
+    if len(clips) == 1:
+        shutil.move(clips[0], out)
+        return
+    graph, prev, offset = [], "0:v", 0
+    for k in range(1, len(clips)):
+        offset += slots[k - 1]
+        graph.append(f"[{prev}][{k}:v]xfade=transition={transitions[k - 1]}:duration={TF / FPS:.3f}:"
+                     f"offset={offset / FPS:.3f}[x{k}]")
+        prev = f"x{k}"
+    inputs = [a for c in clips for a in ("-i", c)]
+    run(["ffmpeg", "-y"] + inputs + ["-filter_complex", ";".join(graph), "-map", f"[{prev}]"] + WORK_ENC + [out])
+    for c in clips:
+        os.remove(c)
+
+
+def join_with_transitions(shots, slots, transitions, tmp):
+    """Joins in chunks of CHUNK shots, then joins the chunks the same way, so ffmpeg never opens 70 files at once."""
+    level = 0
+    while len(shots) > 1:
+        new_shots, new_slots, new_tr = [], [], []
+        for c in range(0, len(shots), CHUNK):
+            group = shots[c:c + CHUNK]
+            out = os.path.join(tmp, f"join{level}_{c:03d}.mp4")
+            xfade_join(group, slots[c:c + CHUNK], transitions[c:c + len(group) - 1], out)
+            new_shots.append(out); new_slots.append(sum(slots[c:c + CHUNK]))
+            if c + CHUNK < len(shots):
+                new_tr.append(transitions[c + CHUNK - 1])
+        shots, slots, transitions, level = new_shots, new_slots, new_tr, level + 1
+    return shots[0]
+
+
+def pick_music():
+    tracks = sorted(glob.glob(os.path.join(MUSIC_DIR, "*.mp3")) + glob.glob(os.path.join(MUSIC_DIR, "*.m4a")))
+    return random.choice(tracks) if tracks else None
+
+
+def final_master(video, voice, tmp):
+    """Final 1080p encode: fade in/out, cleaned-up voice, optional music bed that ducks under the voice,
+    loudness normalised to YouTube's -14 LUFS."""
+    total = duration(voice)
+    vf = f"[0:v]fade=t=in:st=0:d=0.8,fade=t=out:st={max(total - 1.5, 0):.2f}:d=1.5[vv]"
+    voice_fx = "highpass=f=70,lowpass=f=14000,acompressor=threshold=-20dB:ratio=3:attack=10:release=250:makeup=2"
+    music = pick_music()
+    inputs = ["-i", video, "-i", voice]
+    if music:
+        log(f"Music bed: {os.path.basename(music)}")
+        inputs += ["-stream_loop", "-1", "-i", music]
+        af = (f"[1:a]{voice_fx},aresample=48000,asplit=2[vo][key];"
+              f"[2:a]aresample=48000,volume=0.22,afade=t=in:d=2,afade=t=out:st={max(total - 3, 0):.2f}:d=3[mu];"
+              "[mu][key]sidechaincompress=threshold=0.02:ratio=10:attack=30:release=600[duck];"
+              "[vo][duck]amix=inputs=2:duration=first:normalize=0,loudnorm=I=-14:TP=-1.5:LRA=11[aa]")
+    else:
+        log(f"No music in {MUSIC_DIR} (optional: add royalty-free .mp3 files there for a music bed)")
+        af = f"[1:a]{voice_fx},aresample=48000,loudnorm=I=-14:TP=-1.5:LRA=11[aa]"
+    final = os.path.join(tmp, "final.mp4")
+    run(["ffmpeg", "-y"] + inputs + ["-filter_complex", vf + ";" + af, "-map", "[vv]", "-map", "[aa]",
+         "-c:v", "libx264", "-preset", "medium", "-crf", "19", "-profile:v", "high", "-pix_fmt", "yuv420p",
+         "-r", str(FPS), "-g", str(FPS * 2), "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
+         "-t", f"{total:.3f}", "-movflags", "+faststart", final])
+    return final
+
+
+def build_video(durs, plan, audio, tmp):
+    # slot = how many frames each shot owns on the timeline; cumulative rounding keeps picture and voice in sync
+    slots, owner, t = [], [], 0.0
     for i, d in enumerate(durs):
         k = max(1, math.ceil(d / MAX_SHOT))
-        start_f, end_f = round(t * FPS), round((t + d) * FPS)   # cumulative frames keep picture and voice in sync
+        start_f, end_f = round(t * FPS), round((t + d) * FPS)
         t += d
         for j in range(k):
-            frames = (end_f - start_f) * (j + 1) // k - (end_f - start_f) * j // k
-            kind, src = fetch_visual(plan["queries"][i], n % 3 != 2, n, tmp)   # mostly video clips, every 3rd a photo
-            real += kind != "card"
-            log(f"Shot {n + 1}/{total_shots}: {kind:5s} '{plan['queries'][i]}' ({frames / FPS:.1f}s)")
-            shots.append(render_shot(kind, src, max(frames, 1), n, tmp))
-            n += 1
+            slots.append((end_f - start_f) * (j + 1) // k - (end_f - start_f) * j // k)
+            owner.append((i, j))
+    n = len(slots)
+    shots, real, first_frame = [], 0, None
+    for s in range(n):
+        i, j = owner[s]
+        frames = slots[s] + (TF if s < n - 1 else 0)
+        kind, src, used_q = fetch_visual(plan["queries"][i], s % 4 != 3, frames / FPS, s, tmp)   # mostly video, every 4th a photo
+        real += kind != "card"
+        log(f"Shot {s + 1}/{n}: {kind:5s} '{used_q}' ({slots[s] / FPS:.1f}s)")
+        shots.append(render_shot(kind, src, max(frames, TF + 1), s, tmp))
+        if first_frame is None and kind != "card":
+            first_frame = os.path.join(tmp, "frame.jpg")
+            run(["ffmpeg", "-y", "-ss", "1", "-i", shots[-1], "-frames:v", "1", "-q:v", "3", first_frame])
     if real < 0.6 * n:
         raise RuntimeError(f"Only {real}/{n} shots found real footage (Pixabay down or key missing)")
-    lst = os.path.join(tmp, "shots.txt")
-    open(lst, "w").write("".join(f"file '{s}'\n" for s in shots))
-    final = os.path.join(tmp, "final.mp4")
-    log("Joining shots with voiceover")
-    run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", lst, "-i", audio, "-map", "0:v", "-map", "1:a",
-         "-c:v", "copy", "-c:a", "aac", "-b:a", "160k", "-shortest", "-movflags", "+faststart", final])
-    log(f"Video ready ({duration(final) / 60:.1f} min, {n} shots, {os.path.getsize(final) / 1e6:.0f} MB)")
-    return final, shots
+    # transition into each shot: a scene change gets the next style from the list, shots inside a scene just dissolve
+    transitions = [SCENE_TRANSITIONS[owner[s][0] % len(SCENE_TRANSITIONS)] if owner[s][1] == 0 else "fade"
+                   for s in range(1, n)]
+    log(f"Editing: joining {n} shots with transitions")
+    edit = join_with_transitions(shots, slots, transitions, tmp)
+    log("Mastering: colour, fades, audio mix, 1080p encode")
+    final = final_master(edit, audio, tmp)
+    log(f"Video ready ({duration(final) / 60:.1f} min, {n} shots, 1080p, {os.path.getsize(final) / 1e6:.0f} MB)")
+    return final, first_frame
 
 
-def make_thumbnail(plan, shots, tmp):
+def make_thumbnail(plan, frame, tmp):
     """Gemini image if possible, else a Pixabay photo, else a frame from the video. Returns (path, source)."""
     path = os.path.join(tmp, "thumb.jpg")
     if GEMINI_KEY:
@@ -393,11 +476,11 @@ def make_thumbnail(plan, shots, tmp):
             if ("photo", hit["id"]) not in USED:
                 r = requests.get(hit["largeImageURL"], timeout=60)
                 r.raise_for_status()
-                save_cover(r.content, path)
+                save_cover(r.content, path, (1280, 720))
                 return path, "Pixabay"
     except Exception as e:
         log(f"Pixabay thumbnail failed ({e}), using a video frame")
-    run(["ffmpeg", "-y", "-ss", "1", "-i", shots[0], "-frames:v", "1", "-q:v", "3", path])
+    shutil.copy(frame, path)
     return path, "video frame"
 
 
@@ -463,12 +546,12 @@ def main():
                 raise RuntimeError("Script (column F) is empty")
             log(f"Step 1/5: voiceover ({len(scenes)} scenes)")
             audio, durs = make_voiceover(scenes, tmp)
-            log("Step 2/5: matching visuals to the narration")
+            log("Step 2/5: choosing B-roll for every scene")
             plan = plan_visuals(job, scenes)
-            log("Step 3/5: fetching footage and rendering")
-            video, shots = build_video(scenes, durs, plan, audio, tmp)
+            log("Step 3/5: footage, editing and mastering")
+            video, frame = build_video(durs, plan, audio, tmp)
             log("Step 4/5: thumbnail")
-            thumb, thumb_src = make_thumbnail(plan, shots, tmp)
+            thumb, thumb_src = make_thumbnail(plan, frame, tmp)
             log(f"Thumbnail from {thumb_src}")
             log("Step 5/5: uploading")
             url = upload(job, video, thumb)
