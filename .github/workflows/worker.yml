@@ -33,5 +33,8 @@ jobs:
           GEMINI_MODEL: ${{ secrets.GEMINI_MODEL }}             # optional override
           GEMINI_FALLBACK_MODEL: ${{ secrets.GEMINI_FALLBACK_MODEL }}   # optional
           GEMINI_IMAGE_MODEL: ${{ secrets.GEMINI_IMAGE_MODEL }}         # optional override
+          GEMINI_TTS_MODEL: ${{ secrets.GEMINI_TTS_MODEL }}             # optional override
+          GEMINI_TTS_VOICE: ${{ secrets.GEMINI_TTS_VOICE }}             # optional, e.g. Charon / Kore / Puck
+          TTS_ENGINE: ${{ secrets.TTS_ENGINE }}                         # optional, "edge" to switch back
           PYTHONUNBUFFERED: "1"   # show log lines live instead of at the end
         run: python worker/render_upload.py
