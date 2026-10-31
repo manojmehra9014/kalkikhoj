@@ -1,0 +1,31 @@
+name: kalkikhoj-worker
+on:
+  schedule:
+    - cron: "*/30 * * * *"   # GitHub may delay scheduled runs by several minutes
+  workflow_dispatch: {}
+
+concurrency:
+  group: kalkikhoj-worker
+  cancel-in-progress: false
+
+jobs:
+  render-and-upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -y && sudo apt-get install -y ffmpeg
+          pip install -r worker/requirements.txt
+      - name: Run worker
+        env:
+          WEBAPP_URL: ${{ secrets.WEBAPP_URL }}
+          WORKER_TOKEN: ${{ secrets.WORKER_TOKEN }}
+          YT_CLIENT_ID: ${{ secrets.YT_CLIENT_ID }}
+          YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
+          YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
+        run: python worker/render_upload.py
