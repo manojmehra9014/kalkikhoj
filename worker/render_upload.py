@@ -20,6 +20,15 @@ GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL") or "gemini-3.8-flash"
 GEMINI_FALLBACK_MODEL = os.environ.get("GEMINI_FALLBACK_MODEL", "")
 GEMINI_IMAGE_MODEL = os.environ.get("GEMINI_IMAGE_MODEL") or "gemini-2.5-flash-image"
+TTS_ENGINE = os.environ.get("TTS_ENGINE") or "gemini"            # "gemini" (natural narrator) or "edge"
+GEMINI_TTS_MODEL = os.environ.get("GEMINI_TTS_MODEL") or "gemini-2.5-flash-preview-tts"
+GEMINI_TTS_VOICE = os.environ.get("GEMINI_TTS_VOICE") or "Charon"   # calm, informative male; "Kore" = firm female
+EDGE_RATE = os.environ.get("EDGE_RATE") or "-4%"                    # slightly slower sounds less robotic
+SCENES_PER_TTS = 6
+NARRATOR_STYLE = ("Read the following Hindi text aloud as an experienced Indian documentary narrator: warm, natural and "
+                  "conversational, like a real person telling a fascinating story. Use natural pauses at commas and full "
+                  "stops, gentle emphasis on important words, and a steady, unhurried pace. Read only the text below, "
+                  "word for word; do not read these instructions.")
 W, H, FPS = 1280, 720, 25
 SCENE_WORDS = 28      # narration words per scene (~10 s of Hindi speech)
 MAX_SHOT = 7.0        # seconds; longer scenes get several different visuals
@@ -118,7 +127,7 @@ def split_scenes(script):
 def tts(text, path):
     for attempt in range(3):
         try:
-            asyncio.run(edge_tts.Communicate(text, VOICE).save(path))
+            asyncio.run(edge_tts.Communicate(text, VOICE, rate=EDGE_RATE).save(path))
             return
         except Exception:
             if attempt == 2:
@@ -126,21 +135,73 @@ def tts(text, path):
             time.sleep(5)
 
 
-def make_voiceover(scenes, tmp):
-    """One audio file per scene, so each visual can be cut to exactly match its narration."""
-    wavs, durs = [], []
-    for i, text in enumerate(scenes):
-        if i % 10 == 0:
-            log(f"Voiceover scene {i + 1}-{min(i + 10, len(scenes))}/{len(scenes)}")
-        mp3, wav = os.path.join(tmp, f"v{i}.mp3"), os.path.join(tmp, f"v{i}.wav")
-        tts(text, mp3)
-        run(["ffmpeg", "-y", "-i", mp3, "-af", "apad=pad_dur=0.3", "-ar", "24000", "-ac", "1", wav])
-        wavs.append(wav); durs.append(duration(wav))
+def join_wavs(wavs, tmp):
     lst = os.path.join(tmp, "audio.txt")
     open(lst, "w").write("".join(f"file '{f}'\n" for f in wavs))
     out = os.path.join(tmp, "voice.wav")
     run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", lst, "-c", "copy", out])
-    log(f"Voiceover ready ({sum(durs) / 60:.1f} min, {len(scenes)} scenes)")
+    return out
+
+
+def edge_voiceover(scenes, tmp):
+    """One audio file per scene, so each visual can be cut to exactly match its narration."""
+    wavs, durs = [], []
+    for i, text in enumerate(scenes):
+        if i % 10 == 0:
+            log(f"Voiceover (Edge) scene {i + 1}-{min(i + 10, len(scenes))}/{len(scenes)}")
+        mp3, wav = os.path.join(tmp, f"v{i}.mp3"), os.path.join(tmp, f"v{i}.wav")
+        tts(text, mp3)
+        run(["ffmpeg", "-y", "-i", mp3, "-af", "apad=pad_dur=0.3", "-ar", "24000", "-ac", "1", wav])
+        wavs.append(wav); durs.append(duration(wav))
+    return join_wavs(wavs, tmp), durs
+
+
+def gemini_voiceover(scenes, tmp):
+    """Natural narrator voice from Gemini TTS. Scenes are voiced in groups (fewer requests, smoother delivery);
+    each scene's share of a group's audio is estimated from its length in characters."""
+    wavs, durs = [], []
+    groups = [scenes[i:i + SCENES_PER_TTS] for i in range(0, len(scenes), SCENES_PER_TTS)]
+    for g, group in enumerate(groups):
+        log(f"Voiceover (Gemini, {GEMINI_TTS_VOICE}) part {g + 1}/{len(groups)}")
+        text = " ".join(group)
+        body = {"contents": [{"role": "user", "parts": [{"text": NARRATOR_STYLE + "\n\n" + text}]}],
+                "generationConfig": {"responseModalities": ["AUDIO"], "speechConfig": {
+                    "voiceConfig": {"prebuiltVoiceConfig": {"voiceName": GEMINI_TTS_VOICE}}}}}
+        for attempt in range(4):
+            try:
+                part = next(p for p in gemini_call(GEMINI_TTS_MODEL, body, timeout=300) if "inlineData" in p)
+                rate = re.search(r"rate=(\d+)", part["inlineData"].get("mimeType", "")) or None
+                raw, wav = os.path.join(tmp, f"g{g}.pcm"), os.path.join(tmp, f"g{g}.wav")
+                open(raw, "wb").write(base64.b64decode(part["inlineData"]["data"]))
+                run(["ffmpeg", "-y", "-f", "s16le", "-ar", rate.group(1) if rate else "24000", "-ac", "1", "-i", raw,
+                     "-af", "apad=pad_dur=0.4", "-ar", "24000", "-ac", "1", wav])
+                d = duration(wav)
+                if d < len(text) / 30:   # Hindi speech is ~12-18 chars/s; much shorter means the audio was cut off
+                    raise RuntimeError(f"audio too short ({d:.0f}s for {len(text)} chars)")
+                break
+            except Exception as e:
+                if attempt == 3:
+                    raise
+                log(f"  Gemini TTS attempt {attempt + 1} failed: {str(e)[:200]}")
+                time.sleep(20 * (attempt + 1))
+        wavs.append(wav)
+        total = sum(len(s) for s in group)
+        durs += [d * len(s) / total for s in group]
+        time.sleep(5)   # stay under the free tier's requests-per-minute limit
+    return join_wavs(wavs, tmp), durs
+
+
+def make_voiceover(scenes, tmp):
+    if GEMINI_KEY and TTS_ENGINE != "edge":
+        try:
+            out, durs = gemini_voiceover(scenes, tmp)
+            log(f"Voiceover ready (Gemini, {sum(durs) / 60:.1f} min, {len(scenes)} scenes)")
+            return out, durs
+        except Exception as e:
+            # the whole video falls back, so one video never mixes two different voices
+            log(f"Gemini TTS failed ({str(e)[:200]}), using the Edge voice for this video")
+    out, durs = edge_voiceover(scenes, tmp)
+    log(f"Voiceover ready (Edge, {sum(durs) / 60:.1f} min, {len(scenes)} scenes)")
     return out, durs
 
 
