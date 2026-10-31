@@ -28,4 +28,8 @@ jobs:
           YT_CLIENT_ID: ${{ secrets.YT_CLIENT_ID }}
           YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
           YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
+          POLLINATIONS_KEY: ${{ secrets.POLLINATIONS_KEY }}   # optional
+          PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}       # optional
+          PIXABAY_API_KEY: ${{ secrets.PIXABAY_API_KEY }}     # optional
+          PYTHONUNBUFFERED: "1"   # show log lines live instead of at the end
         run: python worker/render_upload.py
