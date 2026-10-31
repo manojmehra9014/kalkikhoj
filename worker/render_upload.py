@@ -185,10 +185,16 @@ def main():
         with tempfile.TemporaryDirectory() as tmp:
             log("Step 1/4: voiceover")
             audio = make_voiceover(job["script"], tmp)
-            log(f"Step 2/4: images ({len(job['image_prompts'])})")
+            prompts = job.get("image_prompts") or []
+            if not prompts:
+                # rows filled by hand / older code may have an empty column T
+                base = job.get("thumb_idea") or job["title"]
+                prompts = [f"{base}, scene {i + 1}" for i in range(6)]
+                log("No image prompts in the Sheet (column T), using the thumbnail idea instead")
+            log(f"Step 2/4: images ({len(prompts)})")
             images = []
-            for i, p in enumerate(job["image_prompts"]):
-                log(f"Image {i + 1}/{len(job['image_prompts'])}")
+            for i, p in enumerate(prompts):
+                log(f"Image {i + 1}/{len(prompts)}")
                 images.append(fetch_image(p, i, tmp))
             log("Step 3/4: rendering video")
             video = build_video(images, audio, tmp)
