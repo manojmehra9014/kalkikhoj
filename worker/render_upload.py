@@ -31,7 +31,14 @@ NARRATOR_STYLE = ("Read the following Hindi text aloud as an experienced Indian 
                   "conversational, like a real person telling a fascinating story. Use natural pauses at commas and full "
                   "stops, gentle emphasis on important words, and a steady, unhurried pace. Read only the text below, "
                   "word for word; do not read these instructions.")
-MUSIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "music")   # drop royalty-free .mp3 files here
+# background music: Internet Archive "netlabels" collection (non-profit, open, no key), most-downloaded first
+MUSIC_MOODS = {"cinematic": "soundtrack cinematic", "epic": "orchestral epic", "suspense": "dark ambient",
+               "dark": "dark ambient", "mysterious": "dark ambient", "technology": "electronic ambient",
+               "electronic": "electronic downtempo", "corporate": "electronic chill", "calm": "ambient chill",
+               "piano": "piano", "emotional": "piano ambient", "inspiring": "uplifting", "uplifting": "uplifting",
+               "orchestral": "orchestral classical", "indian": "indian world", "world": "world", "ambient": "ambient",
+               "documentary": "soundtrack ambient"}
+MUSIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "music")   # optional own .mp3 files (fallback)
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent"
 
 W, H, FPS = 1920, 1080, 25
@@ -227,7 +234,7 @@ def plan_visuals(job, scenes):
     prompts = job.get("image_prompts") or [job.get("thumb_idea") or "india documentary"]
     fallback = [[search_words(prompts[i * len(prompts) // len(scenes)])] for i in range(len(scenes))]
     plan = {"queries": fallback, "thumbnail_prompt": job.get("thumb_idea") or job["title"],
-            "thumbnail_query": fallback[0][0], "thumbnail_text": ""}
+            "thumbnail_query": fallback[0][0], "thumbnail_text": "", "music_tags": ["cinematic", "ambient"]}
     if not GEMINI_KEY:
         log("No GEMINI_API_KEY, using the image prompts from the Sheet as search words")
         return plan
@@ -242,15 +249,21 @@ def plan_visuals(job, scenes):
             "continuity between neighbouring segments.\n"
             f"Also give thumbnail_prompt: a vivid English prompt for an eye-catching 16:9 YouTube thumbnail image about '{job['title']}' "
             "(describe the scene only, no text, no logos, no real people), thumbnail_text: a punchy 2-4 word Hindi headline "
-            "in Devanagari for the thumbnail (curiosity-driven, not misleading), and thumbnail_query: 2-4 words to find a thumbnail photo.\n"
-            f'Return ONLY JSON: {{"queries":["main | backup" x {len(scenes)}],"thumbnail_prompt":"","thumbnail_text":"","thumbnail_query":""}}\n\n'
+            "in Devanagari for the thumbnail (curiosity-driven, not misleading), thumbnail_query: 2-4 words to find a thumbnail photo, "
+            "and music_tags: 2-3 lowercase English music tags describing the right background score for this documentary's "
+            "mood, chosen from: cinematic, ambient, documentary, epic, inspiring, emotional, suspense, dark, mysterious, piano, "
+            "orchestral, electronic, technology, corporate, uplifting, calm, indian, world.\n"
+            f'Return ONLY JSON: {{"queries":["main | backup" x {len(scenes)}],"thumbnail_prompt":"","thumbnail_text":"",'
+            '"thumbnail_query":"","music_tags":["",""]}\n\n'
             "SEGMENTS:\n" + numbered)
         q = [[p.strip() for p in str(x).split("|") if p.strip()] for x in (out.get("queries") or [])]
         plan["queries"] = [(q[i] if i < len(q) and q[i] else []) + fallback[i] for i in range(len(scenes))]
         plan["thumbnail_prompt"] = out.get("thumbnail_prompt") or plan["thumbnail_prompt"]
         plan["thumbnail_query"] = out.get("thumbnail_query") or plan["thumbnail_query"]
         plan["thumbnail_text"] = str(out.get("thumbnail_text") or "").strip()[:40]
-        log(f"Scene plan from Gemini: {len(q)} scenes, e.g. {plan['queries'][:2]}")
+        tags = [re.sub(r"[^a-z]", "", str(t).lower()) for t in (out.get("music_tags") or [])]
+        plan["music_tags"] = [t for t in tags if t][:3] or plan["music_tags"]
+        log(f"Scene plan from Gemini: {len(q)} scenes, e.g. {plan['queries'][:2]}, music mood {plan['music_tags']}")
     except Exception as e:
         log(f"Gemini scene plan failed ({e}), using the image prompts from the Sheet instead")
     return plan
@@ -381,28 +394,84 @@ def join_with_transitions(shots, slots, transitions, tmp):
     return shots[0]
 
 
-def pick_music():
+SAFE_LICENCE = re.compile(r"creativecommons\.org/(licenses/(by|by-sa)/|publicdomain/)")   # OK for monetised videos
+
+
+def track_seconds(f):
+    v = str(f.get("length") or "0")
+    try:
+        return sum(float(p) * 60 ** i for i, p in enumerate(reversed(v.split(":"))))
+    except ValueError:
+        return 0
+
+
+def archive_music(tags, tmp):
+    """Most-downloaded mood-matched track from the Internet Archive netlabels collection whose licence allows use in a
+    monetised video (CC BY, CC BY-SA or public domain; NC/ND are skipped). Returns (path, credit) or (None, "")."""
+    moods = list(dict.fromkeys(MUSIC_MOODS.get(t, t) for t in tags)) + ["ambient soundtrack"]
+    for mood in moods:
+        try:
+            r = requests.get("https://archive.org/advancedsearch.php", timeout=60, params={
+                "q": f"collection:netlabels AND mediatype:audio AND subject:({mood}) "
+                     "AND NOT subject:(vocal vocals rap hiphop noise metal punk)",
+                "fl[]": ["identifier", "title", "creator", "licenseurl", "downloads"],
+                "sort[]": "downloads desc", "rows": 100, "output": "json"})
+            r.raise_for_status()
+            albums = [d for d in r.json().get("response", {}).get("docs", []) if SAFE_LICENCE.search(str(d.get("licenseurl", "")))]
+            log(f"  music '{mood}': {len(albums)} popular albums with a commercial-use licence")
+            for album in random.sample(albums[:6], min(6, len(albums))):   # one of the most downloaded, varied per video
+                meta = requests.get(f"https://archive.org/metadata/{album['identifier']}", timeout=60).json()
+                tracks = [f for f in meta.get("files", []) if f["name"].lower().endswith(".mp3")
+                          and 120 <= track_seconds(f) <= 900]
+                if not tracks:
+                    continue
+                f = random.choice(tracks)
+                path = os.path.join(tmp, "music.mp3")
+                data = requests.get(f"https://archive.org/download/{album['identifier']}/{requests.utils.quote(f['name'])}",
+                                    timeout=300)
+                data.raise_for_status()
+                open(path, "wb").write(data.content)
+                duration(path)   # make sure it is real audio
+                lic = re.sub(r"^https?://creativecommons\.org/(licenses/)?", "CC ", album["licenseurl"]).strip("/")
+                name = f.get("title") or os.path.splitext(f["name"])[0].replace("_", " ")
+                creator = album.get("creator") or "unknown artist"
+                creator = ", ".join(creator) if isinstance(creator, list) else creator
+                credit = (f'Music: "{name}" by {creator} ({lic.replace("/", " ").upper()}), '
+                          f"https://archive.org/details/{album['identifier']}")
+                log(f"Music bed: {name} by {creator} [{mood}, {album.get('downloads')} downloads, {track_seconds(f):.0f}s]")
+                return path, credit
+        except Exception as e:
+            log(f"  music search '{mood}' failed: {e}")
+    return None, ""
+
+
+def pick_music(plan, total_sec, tmp):
+    path, credit = archive_music(plan.get("music_tags") or ["cinematic", "ambient"], tmp)
+    if path:
+        return path, credit
     tracks = sorted(glob.glob(os.path.join(MUSIC_DIR, "*.mp3")) + glob.glob(os.path.join(MUSIC_DIR, "*.m4a")))
-    return random.choice(tracks) if tracks else None
+    if tracks:
+        track = random.choice(tracks)
+        log(f"Music bed (own folder): {os.path.basename(track)}")
+        return track, ""
+    log("No music found for this video, narration only")
+    return None, ""
 
 
-def final_master(video, voice, tmp):
+def final_master(video, voice, tmp, music):
     """Final 1080p encode: fade in/out, cleaned-up voice, optional music bed that ducks under the voice,
     loudness normalised to YouTube's -14 LUFS."""
     total = duration(voice)
     vf = f"[0:v]fade=t=in:st=0:d=0.8,fade=t=out:st={max(total - 1.5, 0):.2f}:d=1.5[vv]"
     voice_fx = "highpass=f=70,lowpass=f=14000,acompressor=threshold=-20dB:ratio=3:attack=10:release=250:makeup=2"
-    music = pick_music()
     inputs = ["-i", video, "-i", voice]
     if music:
-        log(f"Music bed: {os.path.basename(music)}")
         inputs += ["-stream_loop", "-1", "-i", music]
         af = (f"[1:a]{voice_fx},aresample=48000,asplit=2[vo][key];"
               f"[2:a]aresample=48000,volume=0.22,afade=t=in:d=2,afade=t=out:st={max(total - 3, 0):.2f}:d=3[mu];"
               "[mu][key]sidechaincompress=threshold=0.02:ratio=10:attack=30:release=600[duck];"
               "[vo][duck]amix=inputs=2:duration=first:normalize=0,loudnorm=I=-14:TP=-1.5:LRA=11[aa]")
     else:
-        log(f"No music in {MUSIC_DIR} (optional: add royalty-free .mp3 files there for a music bed)")
         af = f"[1:a]{voice_fx},aresample=48000,loudnorm=I=-14:TP=-1.5:LRA=11[aa]"
     final = os.path.join(tmp, "final.mp4")
     run(["ffmpeg", "-y"] + inputs + ["-filter_complex", vf + ";" + af, "-map", "[vv]", "-map", "[aa]",
@@ -441,8 +510,9 @@ def build_video(durs, plan, audio, tmp):
                    for s in range(1, n)]
     log(f"Editing: joining {n} shots with transitions")
     edit = join_with_transitions(shots, slots, transitions, tmp)
+    music, plan["music_credit"] = pick_music(plan, sum(durs), tmp)
     log("Mastering: colour, fades, audio mix, 1080p encode")
-    final = final_master(edit, audio, tmp)
+    final = final_master(edit, audio, tmp, music)
     log(f"Video ready ({duration(final) / 60:.1f} min, {n} shots, 1080p, {os.path.getsize(final) / 1e6:.0f} MB)")
     return final, first_frame
 
@@ -492,10 +562,10 @@ def youtube():
     return build("youtube", "v3", credentials=creds)
 
 
-def upload(job, video, thumb):
+def upload(job, video, thumb, music_credit=""):
     yt = youtube()
     desc = (job["description"] + "\n\nइस वीडियो में AI-जनित आवाज़ का उपयोग किया गया है।"
-            "\nVisuals: Pixabay")
+            "\nVisuals: Pixabay" + (f"\n{music_credit}" if music_credit else ""))   # CC BY music needs this credit
     body = {
         "snippet": {"title": job["title"][:100], "description": desc[:4900], "tags": job["tags"],
                     "categoryId": "27", "defaultLanguage": "hi", "defaultAudioLanguage": "hi"},
@@ -554,7 +624,7 @@ def main():
             thumb, thumb_src = make_thumbnail(plan, frame, tmp)
             log(f"Thumbnail from {thumb_src}")
             log("Step 5/5: uploading")
-            url = upload(job, video, thumb)
+            url = upload(job, video, thumb, plan.get("music_credit", ""))
     except Exception as e:
         traceback.print_exc()
         log("FAILED, telling the Brain so it can retry later")
