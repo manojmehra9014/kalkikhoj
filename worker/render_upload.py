@@ -17,11 +17,25 @@ PRIVACY = os.environ.get("PRIVACY", "public")
 W, H, FPS = 1280, 720, 25
 
 
-def api(payload):
+def log(msg):
+    print(time.strftime("[%H:%M:%S UTC]"), msg, flush=True)
+
+
+def api(payload, tries=1):
     payload["token"] = TOKEN
-    r = requests.post(WEBAPP, json=payload, timeout=120)
-    r.raise_for_status()
-    return r.json()
+    for i in range(tries):
+        try:
+            r = requests.post(WEBAPP, json=payload, timeout=120)
+            r.raise_for_status()
+            j = r.json()
+            if j.get("error"):
+                raise RuntimeError("Apps Script: " + j["error"])
+            return j
+        except Exception as e:
+            if i == tries - 1:
+                raise
+            log(f"API call '{payload.get('action')}' failed ({e}), retrying...")
+            time.sleep(30 * (i + 1))
 
 
 def run(cmd):
@@ -52,7 +66,9 @@ async def tts_chunk(text, path):
 
 def make_voiceover(script, tmp):
     files = []
-    for i, c in enumerate(chunk(script)):
+    parts = chunk(script)
+    for i, c in enumerate(parts):
+        log(f"Voiceover part {i + 1}/{len(parts)}")
         p = os.path.join(tmp, f"v{i}.mp3")
         for attempt in range(3):
             try:
@@ -65,6 +81,7 @@ def make_voiceover(script, tmp):
     open(lst, "w").write("".join(f"file '{f}'\n" for f in files))
     out = os.path.join(tmp, "voice.mp3")
     run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", lst, "-c:a", "libmp3lame", "-b:a", "128k", out])
+    log(f"Voiceover ready ({duration(out) / 60:.1f} min)")
     return out
 
 
@@ -83,8 +100,10 @@ def fetch_image(prompt, idx, tmp):
             l, t = (im.width - W) // 2, (im.height - H) // 2
             im.crop((l, t, l + W, t + H)).save(path, quality=90)
             return path
-        except Exception:
+        except Exception as e:
+            log(f"  image {idx + 1} attempt {attempt + 1} failed: {e}")
             time.sleep(8)
+    log(f"  image {idx + 1}: using plain fallback card")
     Image.new("RGB", (W, H), (20 + idx * 15 % 80, 30, 60)).save(path)   # plain fallback card
     return path
 
@@ -95,6 +114,7 @@ def build_video(images, audio, tmp):
     frames = max(1, int(per * FPS))
     clips = []
     for i, img in enumerate(images):
+        log(f"Rendering clip {i + 1}/{len(images)}")
         out = os.path.join(tmp, f"clip{i}.mp4")
         vf = (f"scale={W*2}:{H*2},zoompan=z='min(zoom+0.0003,1.12)':d={frames}"
               f":x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s={W}x{H}:fps={FPS},format=yuv420p")
@@ -104,8 +124,10 @@ def build_video(images, audio, tmp):
     lst = os.path.join(tmp, "clips.txt")
     open(lst, "w").write("".join(f"file '{c}'\n" for c in clips))
     final = os.path.join(tmp, "final.mp4")
+    log("Joining clips with voiceover")
     run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", lst, "-i", audio,
          "-c:v", "copy", "-c:a", "aac", "-b:a", "128k", "-shortest", "-movflags", "+faststart", final])
+    log(f"Video ready ({os.path.getsize(final) / 1e6:.0f} MB)")
     return final
 
 
@@ -125,20 +147,26 @@ def upload(job, video, thumb):
         "status": {"privacyStatus": PRIVACY, "selfDeclaredMadeForKids": False, "containsSyntheticMedia": True},
     }
     media = MediaFileUpload(video, chunksize=8 * 1024 * 1024, resumable=True, mimetype="video/mp4")
-    try:
+
+    def send():
         req = yt.videos().insert(part="snippet,status", body=body, media_body=media)
         resp = None
         while resp is None:
-            _, resp = req.next_chunk()
+            status, resp = req.next_chunk()
+            if status:
+                log(f"Uploading to YouTube: {int(status.progress() * 100)}%")
+        return resp
+
+    log(f"Uploading to YouTube ({PRIVACY})")
+    try:
+        resp = send()
     except HttpError as e:
         if "containsSyntheticMedia" not in str(e):
             raise
         body["status"].pop("containsSyntheticMedia")   # older API surface: retry without the flag
-        req = yt.videos().insert(part="snippet,status", body=body, media_body=media)
-        resp = None
-        while resp is None:
-            _, resp = req.next_chunk()
+        resp = send()
     vid = resp["id"]
+    log(f"Uploaded, video id {vid}")
     try:
         yt.thumbnails().set(videoId=vid, media_body=MediaFileUpload(thumb, mimetype="image/jpeg")).execute()
     except Exception as e:
@@ -147,22 +175,39 @@ def upload(job, video, thumb):
 
 
 def main():
-    job = api({"action": "next"}).get("job")
+    log("Asking the Brain for a job...")
+    job = api({"action": "next"}, tries=3).get("job")
     if not job:
-        print("No job."); return
-    print("Job:", job["id"], job["title"])
+        log("No job. (No QUEUE_RENDER row in the Sheet, today's publish limit reached, or pipeline paused.)")
+        return
+    log(f"Job picked: {job['id']} | row {job['row']} | {job['title']}")
     try:
         with tempfile.TemporaryDirectory() as tmp:
+            log("Step 1/4: voiceover")
             audio = make_voiceover(job["script"], tmp)
-            images = [fetch_image(p, i, tmp) for i, p in enumerate(job["image_prompts"])]
+            log(f"Step 2/4: images ({len(job['image_prompts'])})")
+            images = []
+            for i, p in enumerate(job["image_prompts"]):
+                log(f"Image {i + 1}/{len(job['image_prompts'])}")
+                images.append(fetch_image(p, i, tmp))
+            log("Step 3/4: rendering video")
             video = build_video(images, audio, tmp)
+            log("Step 4/4: uploading")
             url = upload(job, video, images[0])
-        api({"action": "done", "row": job["row"], "url": url})
-        print("Published:", url)
     except Exception as e:
         traceback.print_exc()
-        api({"action": "fail", "row": job["row"], "error": str(e)[:300]})
+        log("FAILED, telling the Brain so it can retry later")
+        api({"action": "fail", "row": job["row"], "error": str(e)[:300]}, tries=3)
         sys.exit(1)
+    # Outside the try: once the video is on YouTube, never report "fail" (that would re-queue and upload it twice).
+    log(f"Published: {url}")
+    try:
+        api({"action": "done", "row": job["row"], "url": url}, tries=5)
+    except Exception:
+        traceback.print_exc()
+        log(f"!! Video is LIVE but the Sheet was not updated. Set row {job['row']} to PUBLISHED and paste {url} in column N.")
+        sys.exit(1)
+    log("Sheet updated to PUBLISHED. Done.")
 
 
 if __name__ == "__main__":
