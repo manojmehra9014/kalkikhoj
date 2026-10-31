@@ -14,6 +14,10 @@ WEBAPP = os.environ["WEBAPP_URL"]
 TOKEN = os.environ["WORKER_TOKEN"]
 VOICE = os.environ.get("TTS_VOICE", "hi-IN-SwaraNeural")
 PRIVACY = os.environ.get("PRIVACY", "public")
+POLLINATIONS_KEY = os.environ.get("POLLINATIONS_KEY", "")   # optional, from enter.pollinations.ai
+PEXELS_KEY = os.environ.get("PEXELS_API_KEY", "")           # optional free stock-photo fallback
+PIXABAY_KEY = os.environ.get("PIXABAY_API_KEY", "")         # optional free stock-photo fallback (pixabay.com/api/docs)
+POLLINATIONS_DOWN = False   # set after one image fails completely, so the rest don't wait for a dead service
 W, H, FPS = 1280, 720, 25
 
 
@@ -85,27 +89,100 @@ def make_voiceover(script, tmp):
     return out
 
 
-def fetch_image(prompt, idx, tmp):
-    path = os.path.join(tmp, f"img{idx}.jpg")
+def save_cover(data, path):
+    im = Image.open(io.BytesIO(data)).convert("RGB")
+    # cover-crop to 16:9
+    scale = max(W / im.width, H / im.height)
+    im = im.resize((int(im.width * scale), int(im.height * scale)))
+    l, t = (im.width - W) // 2, (im.height - H) // 2
+    im.crop((l, t, l + W, t + H)).save(path, quality=90)
+
+
+def from_pollinations(prompt, idx, path):
+    global POLLINATIONS_DOWN
+    if POLLINATIONS_DOWN:
+        return False
     q = urllib.parse.quote(prompt + ", cinematic, no text, no logos")
+    headers = {"Authorization": f"Bearer {POLLINATIONS_KEY}"} if POLLINATIONS_KEY else {}
     for attempt in range(3):
         try:
-            r = requests.get(f"https://image.pollinations.ai/prompt/{q}",
+            r = requests.get(f"https://image.pollinations.ai/prompt/{q}", headers=headers,
                              params={"width": W, "height": H, "nologo": "true", "seed": idx * 7 + attempt},
                              timeout=120)
-            im = Image.open(io.BytesIO(r.content)).convert("RGB")
-            # cover-crop to 16:9
-            scale = max(W / im.width, H / im.height)
-            im = im.resize((int(im.width * scale), int(im.height * scale)))
-            l, t = (im.width - W) // 2, (im.height - H) // 2
-            im.crop((l, t, l + W, t + H)).save(path, quality=90)
-            return path
+            if r.status_code != 200 or not r.headers.get("content-type", "").startswith("image/"):
+                raise RuntimeError(f"HTTP {r.status_code}: {r.text[:150]}")
+            save_cover(r.content, path)
+            return True
         except Exception as e:
-            log(f"  image {idx + 1} attempt {attempt + 1} failed: {e}")
-            time.sleep(8)
+            log(f"  image {idx + 1} pollinations attempt {attempt + 1} failed: {e}")
+            if attempt < 2:
+                time.sleep(15 * (attempt + 1))
+    POLLINATIONS_DOWN = True
+    log("  pollinations looks down, using stock photos for the remaining images")
+    return False
+
+
+def search_words(prompt):
+    # stock photo search works best with a few plain words from the start of the prompt
+    return re.sub(r"[^A-Za-z0-9 ]", " ", prompt.split(",")[0]).split()[:6]
+
+
+def from_pixabay(prompt, idx, path):
+    words = search_words(prompt)
+    try:
+        hits = []
+        for q in (" ".join(words), " ".join(words[:3])):   # retry with fewer words if nothing matched
+            r = requests.get("https://pixabay.com/api/", timeout=60,
+                             params={"key": PIXABAY_KEY, "q": q[:100] or "india", "image_type": "photo",
+                                     "orientation": "horizontal", "safesearch": "true", "per_page": 5})
+            r.raise_for_status()
+            hits = r.json().get("hits") or []
+            if hits:
+                break
+        if not hits:
+            raise RuntimeError("no results for: " + " ".join(words))
+        img = requests.get(hits[idx % len(hits)]["largeImageURL"], timeout=60)
+        img.raise_for_status()
+        save_cover(img.content, path)
+        return True
+    except Exception as e:
+        log(f"  image {idx + 1} pixabay failed: {e}")
+        return False
+
+
+def from_pexels(prompt, idx, path):
+    words = search_words(prompt)
+    try:
+        r = requests.get("https://api.pexels.com/v1/search", headers={"Authorization": PEXELS_KEY},
+                         params={"query": " ".join(words) or "india", "orientation": "landscape", "per_page": 5},
+                         timeout=60)
+        r.raise_for_status()
+        photos = r.json().get("photos") or []
+        if not photos:
+            raise RuntimeError("no results for: " + " ".join(words))
+        img = requests.get(photos[idx % len(photos)]["src"]["large2x"], timeout=60)
+        img.raise_for_status()
+        save_cover(img.content, path)
+        return True
+    except Exception as e:
+        log(f"  image {idx + 1} pexels failed: {e}")
+        return False
+
+
+def fetch_image(prompt, idx, tmp):
+    """Returns (path, real) - real is False when only a plain colour card could be made."""
+    path = os.path.join(tmp, f"img{idx}.jpg")
+    if from_pollinations(prompt, idx, path):
+        return path, True
+    if PIXABAY_KEY and from_pixabay(prompt, idx, path):
+        log(f"  image {idx + 1}: used a Pixabay stock photo")
+        return path, True
+    if PEXELS_KEY and from_pexels(prompt, idx, path):
+        log(f"  image {idx + 1}: used a Pexels stock photo")
+        return path, True
     log(f"  image {idx + 1}: using plain fallback card")
     Image.new("RGB", (W, H), (20 + idx * 15 % 80, 30, 60)).save(path)   # plain fallback card
-    return path
+    return path, False
 
 
 def build_video(images, audio, tmp):
@@ -192,10 +269,14 @@ def main():
                 prompts = [f"{base}, scene {i + 1}" for i in range(6)]
                 log("No image prompts in the Sheet (column T), using the thumbnail idea instead")
             log(f"Step 2/4: images ({len(prompts)})")
-            images = []
+            images, real = [], 0
             for i, p in enumerate(prompts):
                 log(f"Image {i + 1}/{len(prompts)}")
-                images.append(fetch_image(p, i, tmp))
+                path, ok = fetch_image(p, i, tmp)
+                images.append(path); real += ok
+            if real < len(prompts) / 2:
+                # don't publish a video made mostly of blank cards; the Brain re-queues it for the next run
+                raise RuntimeError(f"Only {real}/{len(prompts)} images could be fetched (image service down)")
             log("Step 3/4: rendering video")
             video = build_video(images, audio, tmp)
             log("Step 4/4: uploading")
