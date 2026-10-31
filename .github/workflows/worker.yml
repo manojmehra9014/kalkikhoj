@@ -11,7 +11,7 @@ concurrency:
 jobs:
   render-and-upload:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -28,8 +28,10 @@ jobs:
           YT_CLIENT_ID: ${{ secrets.YT_CLIENT_ID }}
           YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
           YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
-          POLLINATIONS_KEY: ${{ secrets.POLLINATIONS_KEY }}   # optional
-          PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}       # optional
-          PIXABAY_API_KEY: ${{ secrets.PIXABAY_API_KEY }}     # optional
+          PIXABAY_API_KEY: ${{ secrets.PIXABAY_API_KEY }}       # required: stock videos/photos
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}         # scene plan + thumbnail (optional but recommended)
+          GEMINI_MODEL: ${{ secrets.GEMINI_MODEL }}             # optional override
+          GEMINI_FALLBACK_MODEL: ${{ secrets.GEMINI_FALLBACK_MODEL }}   # optional
+          GEMINI_IMAGE_MODEL: ${{ secrets.GEMINI_IMAGE_MODEL }}         # optional override
           PYTHONUNBUFFERED: "1"   # show log lines live instead of at the end
         run: python worker/render_upload.py
