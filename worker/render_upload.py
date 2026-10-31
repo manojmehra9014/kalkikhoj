@@ -525,7 +525,7 @@ def final_master(video, voice, tmp, music):
     if music:
         inputs += ["-stream_loop", "-1", "-i", music]
         af = (f"[1:a]{voice_fx},aresample=48000,asplit=2[vo][key];"
-              f"[2:a]aresample=48000,volume=0.22,afade=t=in:d=2,afade=t=out:st={max(total - 3, 0):.2f}:d=3[mu];"
+              f"[2:a]aresample=48000,volume=0.35,afade=t=in:d=2,afade=t=out:st={max(total - 3, 0):.2f}:d=3[mu];"
               "[mu][key]sidechaincompress=threshold=0.02:ratio=10:attack=30:release=600[duck];"
               "[vo][duck]amix=inputs=2:duration=first:normalize=0,loudnorm=I=-14:TP=-1.5:LRA=11[aa]")
     else:
