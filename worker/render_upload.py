@@ -19,7 +19,9 @@ PIXABAY_KEY = os.environ.get("PIXABAY_API_KEY", "")
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL") or "gemini-3.8-flash"
 GEMINI_FALLBACK_MODEL = os.environ.get("GEMINI_FALLBACK_MODEL", "")
-GEMINI_IMAGE_MODEL = os.environ.get("GEMINI_IMAGE_MODEL") or "gemini-2.5-flash-image"
+# Thumbnail models, tried in order: Nano Banana Pro first (best quality, renders headline text), then Nano Banana.
+GEMINI_IMAGE_MODELS = [m.strip() for m in (os.environ.get("GEMINI_IMAGE_MODEL")
+                       or "gemini-3-pro-image-preview,gemini-2.5-flash-image").split(",") if m.strip()]
 TTS_ENGINE = os.environ.get("TTS_ENGINE") or "gemini"            # "gemini" (natural narrator) or "edge"
 GEMINI_TTS_MODEL = os.environ.get("GEMINI_TTS_MODEL") or "gemini-2.5-flash-preview-tts"
 GEMINI_TTS_VOICE = os.environ.get("GEMINI_TTS_VOICE") or "Charon"   # calm, informative male; "Kore" = firm female
@@ -97,9 +99,10 @@ def gemini_json(prompt):
     raise RuntimeError(f"Gemini unavailable: {last}")
 
 
-def gemini_image(prompt, path):
-    parts = gemini_call(GEMINI_IMAGE_MODEL, {"contents": [{"role": "user", "parts": [{"text": prompt}]}],
-                                             "generationConfig": {"responseModalities": ["TEXT", "IMAGE"]}})
+def gemini_image(model, prompt, path):
+    parts = gemini_call(model, {"contents": [{"role": "user", "parts": [{"text": prompt}]}],
+                                "generationConfig": {"responseModalities": ["TEXT", "IMAGE"],
+                                                     "imageConfig": {"aspectRatio": "16:9"}}}, timeout=300)
     for p in parts:
         data = (p.get("inlineData") or p.get("inline_data") or {}).get("data")
         if data:
@@ -214,7 +217,8 @@ def plan_visuals(job, scenes):
     """English stock-footage search words for every scene + a thumbnail prompt."""
     prompts = job.get("image_prompts") or [job.get("thumb_idea") or "india documentary"]
     fallback = [search_words(prompts[i * len(prompts) // len(scenes)]) for i in range(len(scenes))]
-    plan = {"queries": fallback, "thumbnail_prompt": job.get("thumb_idea") or job["title"], "thumbnail_query": fallback[0]}
+    plan = {"queries": fallback, "thumbnail_prompt": job.get("thumb_idea") or job["title"], "thumbnail_query": fallback[0],
+            "thumbnail_text": ""}
     if not GEMINI_KEY:
         log("No GEMINI_API_KEY, using the image prompts from the Sheet as search words")
         return plan
@@ -226,13 +230,15 @@ def plan_visuals(job, scenes):
             "'robot arm factory', 'student using laptop', 'ancient temple ruins'. Show what is being talked about; no names of real "
             "people or brands, no abstract words.\n"
             f"Also give thumbnail_prompt: a vivid English prompt for an eye-catching 16:9 YouTube thumbnail image about '{job['title']}' "
-            "(no text, no logos, no real people), and thumbnail_query: 2-4 words to find a thumbnail photo.\n"
-            f'Return ONLY JSON: {{"queries":["..." x {len(scenes)}],"thumbnail_prompt":"","thumbnail_query":""}}\n\n'
+            "(describe the scene only, no text, no logos, no real people), thumbnail_text: a punchy 2-4 word Hindi headline "
+            "in Devanagari for the thumbnail (curiosity-driven, not misleading), and thumbnail_query: 2-4 words to find a thumbnail photo.\n"
+            f'Return ONLY JSON: {{"queries":["..." x {len(scenes)}],"thumbnail_prompt":"","thumbnail_text":"","thumbnail_query":""}}\n\n'
             "SEGMENTS:\n" + numbered)
         q = [str(x).strip() for x in (out.get("queries") or [])]
         plan["queries"] = [q[i] if i < len(q) and q[i] else fallback[i] for i in range(len(scenes))]
         plan["thumbnail_prompt"] = out.get("thumbnail_prompt") or plan["thumbnail_prompt"]
         plan["thumbnail_query"] = out.get("thumbnail_query") or plan["thumbnail_query"]
+        plan["thumbnail_text"] = str(out.get("thumbnail_text") or "").strip()[:40]
         log(f"Scene plan from Gemini: {len(q)} queries, e.g. {plan['queries'][:3]}")
     except Exception as e:
         log(f"Gemini scene plan failed ({e}), using the image prompts from the Sheet instead")
@@ -362,11 +368,26 @@ def make_thumbnail(plan, shots, tmp):
     """Gemini image if possible, else a Pixabay photo, else a frame from the video. Returns (path, source)."""
     path = os.path.join(tmp, "thumb.jpg")
     if GEMINI_KEY:
-        try:
-            gemini_image(plan["thumbnail_prompt"] + ". 16:9 YouTube thumbnail, dramatic lighting, no text, no logos.", path)
-            return path, "Gemini"
-        except Exception as e:
-            log(f"Gemini thumbnail failed ({str(e)[:200]}), using a stock photo")
+        for model in GEMINI_IMAGE_MODELS:
+            # only the Pro model writes text reliably; the others get a clean picture
+            text = plan.get("thumbnail_text") if "pro" in model else ""
+            prompt = (f"Create a professional, eye-catching 16:9 YouTube thumbnail for a Hindi documentary. Scene: "
+                      f"{plan['thumbnail_prompt']}. Cinematic, high contrast, vivid colours, dramatic lighting, one clear "
+                      "subject, sharp focus, no logos, no watermarks, no real people. " +
+                      (f'Add the Hindi headline "{text}" in large, bold, perfectly spelled Devanagari letters with a strong '
+                       "outline, on one side of the image so it does not cover the subject. No other text."
+                       if text else "No text at all."))
+            for attempt in range(2):
+                try:
+                    gemini_image(model, prompt, path)
+                    plan["thumbnail_prompt_used"] = prompt
+                    return path, f"Gemini ({model})"
+                except Exception as e:
+                    log(f"Thumbnail with {model} failed: {str(e)[:200]}")
+                    if " 429" not in str(e) and " 503" not in str(e):
+                        break   # e.g. model not available on this key: try the next model
+                    time.sleep(20)
+        log("Gemini thumbnail not possible, using a stock photo")
     try:
         for hit in pixabay("photo", plan["thumbnail_query"]):
             if ("photo", hit["id"]) not in USED:
@@ -460,7 +481,7 @@ def main():
     log(f"Published: {url}")
     try:
         api({"action": "done", "row": job["row"], "url": url, "title": job["title"],
-             "thumb_prompt": plan["thumbnail_prompt"], "thumb_source": thumb_src}, tries=5)
+             "thumb_prompt": plan.get("thumbnail_prompt_used") or plan["thumbnail_prompt"], "thumb_source": thumb_src}, tries=5)
     except Exception:
         traceback.print_exc()
         log(f"!! Video is LIVE but the Sheet was not updated. Set row {job['row']} to PUBLISHED and paste {url} in column N.")
